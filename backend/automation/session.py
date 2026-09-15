@@ -427,35 +427,6 @@ def _store_cached_response(url: str, status: int, headers: dict, body: bytes) ->
         return
 
 
-def _maybe_cache_low_traffic_response(response) -> None:
-    """原生网络返回后再写入缓存，避免 route.fetch 再绕一圈代理。"""
-    try:
-        request = getattr(response, "request", None)
-        if request is None:
-            return
-        url = str(getattr(request, "url", "") or "")
-        resource_type = str(getattr(request, "resource_type", "") or "")
-        method = str(getattr(request, "method", "GET") or "GET")
-        request_headers = getattr(request, "headers", {}) or {}
-        if any(str(key).lower() == "range" for key in request_headers):
-            return
-        if not low_traffic_should_cache(url, resource_type, method):
-            return
-        if _cached_response(url) is not None:
-            return
-        status = int(getattr(response, "status", 0) or 0)
-        if status != 200:
-            return
-        body = response.body()
-        headers = dict(getattr(response, "headers", {}) or {})
-        lock = _low_traffic_cache_lock(url)
-        with lock:
-            if _cached_response(url) is None:
-                _store_cached_response(url, status, headers, body)
-    except Exception:
-        return
-
-
 def _install_low_traffic_routing(browser_context, log_callback=None) -> None:
     if not low_traffic_enabled() or not hasattr(browser_context, "route"):
         return
@@ -484,11 +455,20 @@ def _install_low_traffic_routing(browser_context, log_callback=None) -> None:
             status, headers, body = cached
             route.fulfill(status=status, headers=headers, body=body)
             return
-        route.continue_()
+        try:
+            response = route.fetch()
+            body = response.body()
+            headers = dict(response.headers or {})
+            status = int(response.status or 0)
+            with lock:
+                if _cached_response(url) is None:
+                    _store_cached_response(url, status, headers, body)
+            route.fulfill(response=response, body=body)
+            return
+        except Exception:
+            route.continue_()
 
     browser_context.route(low_traffic_should_intercept, handle)
-    if hasattr(browser_context, "on"):
-        browser_context.on("response", _maybe_cache_low_traffic_response)
     if log_callback:
         if traffic_savings_level() == "more":
             log_callback("[*] 低流量模式：已启用 grok.com 与 accounts.x.ai 静态资源缓存与非业务媒体拦截")
